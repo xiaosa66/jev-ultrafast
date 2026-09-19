@@ -18,9 +18,9 @@ class StalePage(ValueError):
 
 
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, *, background=True, settle_seconds=0):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        self.target = cdp("Target.createTarget", url="about:blank", background=background)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
@@ -31,6 +31,8 @@ class Browser:
             if self.evaluate("document.readyState") == "complete":
                 break
             time.sleep(0.02)
+        if settle_seconds:
+            time.sleep(settle_seconds)  # let SPA render before first observe (e.g. trading panels)
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)

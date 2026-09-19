@@ -91,6 +91,25 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+### Bitget demo trading
+
+`examples/bitget.py` places one order on the Bitget **demo** perpetual swap market via the same agent policy. Four scenarios: `limit_buy`, `market_buy`, `limit_sell`, `market_sell`.
+
+Prerequisites:
+
+1. Chrome with remote debugging: `--remote-debugging-port=9222` (the `chromium-cdp-mac` skill / `~/scripts/chrome-cdp.sh` start it). The agent opens a **foreground** tab in this Chrome.
+2. Log into Bitget and switch to the **Demo unified account** (not the live account — the demo has paper funds). The tab stays logged in; the agent reuses the profile.
+3. `.env` with `TYPESAFE_API_KEY` and `TEXT_MODEL_API_KEY`. A Vercel `vck_` key works for both via the gateway (see `.env.example`).
+
+```bash
+uv run --env-file .env python examples/bitget.py limit_buy        # 70000 limit buy, 0.001 BTC
+uv run --env-file .env python examples/bitget.py market_buy       # market buy, 0.001 BTC
+uv run --env-file .env python examples/bitget.py limit_sell       # 90000 limit sell, 0.001 BTC
+uv run --env-file .env python examples/bitget.py market_sell      # market sell, 0.001 BTC
+```
+
+Each run prints the step history and verifies the Open orders / Positions count moved. The browser tab is left open (`--no-keep-open` closes it). State and screenshots land in `artifacts/bitget/<scenario>/`.
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.
