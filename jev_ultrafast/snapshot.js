@@ -94,8 +94,12 @@
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics=actions.map(({rect,...action})=>action);
+  // document.title and the visible text are deliberately left out: on live pages
+  // (quotes, order books, unread counters) they change on every tick, which makes
+  // fill actions permanently stale. location.href already covers navigation and
+  // semantics covers structural change, so the guard stays just as meaningful.
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    document.title,text,semantics,page_key[6]];
+    semantics,page_key[6]];
   const omitted_actions=Math.max(0,actions.length-250);
   actions.splice(250);
   actions.forEach((a,i)=>a.id='e'+(i+1));
