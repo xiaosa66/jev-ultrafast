@@ -18,21 +18,41 @@ class StalePage(ValueError):
 
 
 class Browser:
-    def __init__(self, url, *, background=True, settle_seconds=0):
+    def __init__(self, url, *, background=True, settle_seconds=0, reuse=False):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=background)["targetId"]
-        self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
-        # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
-        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
-                break
-            time.sleep(0.02)
+        # reuse=True adopts an already-open tab on the same page instead of opening a
+        # new one: it keeps the signed-in session and avoids re-navigation, which some
+        # sites (Cloudflare-fronted ones) rate-limit or block.
+        self.target = self._find_tab(url) if reuse else None
+        self.owned = self.target is None
+        if self.target is None:
+            self.target = cdp("Target.createTarget", url="about:blank", background=background)["targetId"]
+            self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+            self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+            # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
+            self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            self.call("Page.navigate", url=url)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if self.evaluate("document.readyState") == "complete":
+                    break
+                time.sleep(0.02)
+        else:
+            self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         if settle_seconds:
             time.sleep(settle_seconds)  # let SPA render before first observe (e.g. trading panels)
+
+    @staticmethod
+    def _find_tab(url):
+        from urllib.parse import urlsplit
+        want = urlsplit(url)
+        for info in cdp("Target.getTargets").get("targetInfos", []):
+            if info.get("type") != "page":
+                continue
+            got = urlsplit(info.get("url", ""))
+            if got.netloc == want.netloc and got.path.rstrip("/") == want.path.rstrip("/"):
+                return info["targetId"]
+        return None
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
@@ -55,7 +75,10 @@ class Browser:
                       const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
-                      setTimeout(finish,autocomplete ? 200 : 50);
+                      // Modals and menus animate in (scale/opacity). Observing mid-animation
+                      // sees a half-sized, still-transparent dialog that never enters the
+                      // action list, and the agent re-clicks the covered button forever.
+                      setTimeout(finish,autocomplete ? 400 : 600);
                       const ready=()=>{
                         if (stopped) return;
                         const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
@@ -88,15 +111,19 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        # Compare the target control only: its identity, role, name and interaction
+        # state. Values and surrounding text are skipped on purpose -- live pages
+        # (quotes, order books, counters) rewrite them on every tick, so a stricter
+        # comparison marks every action stale and the run never advances.
+        if action is not None and action["kind"] in {"click", "select", "fill"}:
             node = action["node"]
             if type(node) is not int:
                 return False
             current = self.evaluate(
                 "(() => { const c=window.__jevFast; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
+                f"return c ? c.guard(c.nodes.get({node})) : null; }})()"
             )
-            return current == [page["page_key"], page["guards"].get(str(node))]
+            return stable(current) == stable(page["guards"].get(str(node)))
         return self.evaluate(MARKER) == page["marker"]
 
     def act(self, action, page, text=None):
@@ -109,9 +136,22 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
+        if self.target and self.owned:
             cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        self.target = None
+
+
+# Guard fields that must hold for an action: identity, role, name, readOnly,
+# disabled and the aria state flags. Index 3/4/5 (value, checked, selectedIndex)
+# and 13 (surrounding text) are the ones a live page rewrites constantly.
+STABLE_FIELDS = (0, 1, 2, 6, 7, 8, 9, 10, 11, 12)
+
+
+def stable(guard):
+    """The part of a guard that a live page does not churn."""
+    if not guard:
+        return None
+    return [guard[i] for i in STABLE_FIELDS]
 
 
 def fingerprint(state):
@@ -145,12 +185,21 @@ def browser_operation(request):
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
             target = evaluate("""(action => {
               const e=window.__jevFast?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
+              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]')) return null;
+              const ok=el=>el.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
+              let geo=e;
+              if (!ok(e) || !e.getBoundingClientRect().width) {
+                // Hidden native checkbox/radio (opacity:0, 0x0): click its visible wrapper.
+                const p=e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type)
+                  ? (e.closest('label')||e.closest('[role="checkbox"],[role="radio"],[role="switch"]')||e.parentElement)
+                  : null;
+                if (!p || !ok(p) || !p.getBoundingClientRect().width) return null;
+                geo=p;
+              }
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
+              const r=geo.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
               if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
+              if (!geo.contains(document.elementFromPoint(x,y))) return null;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                     !o.disabled && !o.closest('optgroup[disabled]'))) return null;

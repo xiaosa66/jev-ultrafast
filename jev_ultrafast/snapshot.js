@@ -9,6 +9,18 @@
   const safe = e => !['password','file','hidden'].includes(e.type);
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
+  // UI kits (antd, MUI, bit-ui, ...) hide the native checkbox/radio -- opacity:0,
+  // 0x0, or clipped -- and paint a span on top. The input is then invisible to
+  // checkVisibility even though the control is plainly on screen. Fall back to the
+  // visible clickable wrapper (its <label>), which toggles the same input.
+  const proxy = e => {
+    if (!e || e.tagName !== 'INPUT' || !['checkbox','radio'].includes(e.type)) return null;
+    if (visible(e) && e.getBoundingClientRect().width > 0) return null;
+    const w = e.closest('label') ||
+      e.closest('[role="checkbox"],[role="radio"],[role="switch"]') || e.parentElement;
+    if (!w || !visible(w)) return null;
+    return w.getBoundingClientRect().width > 0 ? w : null;
+  };
   const name = (e,seen=new Set()) => {
     if (!e || seen.has(e)) return '';
     seen.add(e);
@@ -20,6 +32,23 @@
       (e.tagName==='INPUT' ? '' : [...e.childNodes].map(n=>n.nodeType===3 ? n.textContent :
         n.nodeType===1 && n.getAttribute('aria-hidden')!=='true' ? name(n,seen) : '').join(' ').trim()) ||
       e.getAttribute('title') || e.getAttribute('placeholder') || '';
+  };
+  // Many trading/dashboard UIs ship inputs with no aria-label, placeholder or <label>
+  // (react/bit-ui wraps them in styled spans). Their surrounding text is the only
+  // name available; walk outwards and collect the preceding sibling texts.
+  const contextLabel = e => {
+    const parts = [];
+    let node = e;
+    for (let i = 0; i < 4 && node?.parentElement; i++) {
+      let s = node.previousElementSibling;
+      while (s) {
+        const t = (s.innerText || '').replace(/\s+/g, ' ').trim();
+        if (t && t.length < 40) { parts.unshift(t); break; }
+        s = s.previousElementSibling;
+      }
+      node = node.parentElement;
+    }
+    return parts.filter((t,i,arr)=>arr.indexOf(t)===i).join(' ').slice(0, 60);
   };
   const roles=['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
     'option','gridcell','combobox','textbox','searchbox','spinbutton'];
@@ -45,20 +74,57 @@
     [...document.querySelectorAll('input,textarea,select')].filter(safe)
       .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
   cache.guard=e=>{
-    if (!e?.isConnected || !visible(e)) return null;
-    const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
+    if (!e?.isConnected) return null;
+    const geo=visible(e)?e:proxy(e);
+    if (!geo) return null;
+    const scope=geo.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || geo.parentElement;
     return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
+  const words=[], chunks=[],
+    walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
+  const range=document.createRange(); let node,length=0;
+  while ((node=walker.nextNode()) && length<6000) {
+    const value=node.textContent.trim(), parent=node.parentElement;
+    if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
+    range.selectNodeContents(node); const r=range.getBoundingClientRect();
+    if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
+      words.push(value); length+=value.length;
+      chunks.push({t:value, top:r.top, bottom:r.bottom, left:r.left, right:r.right});
+    }
+  }
+  const text=words.join('\n').slice(0,6000);
+  // Closest visible text above a control, roughly aligned with it. Form-kit inputs
+  // (bit-form-item and friends) keep their label in a sibling column, so the only
+  // reliable name is the text the user reads just above the field.
+  const nearLabel = r => {
+    let best=null, gap=1e9;
+    for (const c of chunks) {
+      const t=c.t;
+      if (t.length > 24 || c.bottom > r.y + 6) continue;
+      if (/^[\d.,%+\-/:\s]+$/.test(t)) continue;  // quotes and figures are not field names
+      if (c.right < r.x - 80 || c.left > r.x + r.width + 80) continue;
+      const d=r.y-c.bottom;
+      if (d < gap) { gap=d; best=c.t; }
+    }
+    return gap < 40 ? best : '';
+  };
   const actions=[];
   for (const e of document.querySelectorAll(selector)) {
-    if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
-    const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
+    if (!safe(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
+    let geo=e;
+    if (!visible(e) || !e.getBoundingClientRect().width) {
+      const p=proxy(e);
+      if (!p) continue;
+      geo=p;  // hidden native control: act on the visible wrapper, keep the input's semantics
+    }
+    const r=geo.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
     if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
-    const base={node:identity(e),role:rname,label:name(e)||rname,
+    const base={node:identity(e),role:rname,
+      label:name(geo)||name(e)||contextLabel(e)||nearLabel(r)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
@@ -79,17 +145,7 @@
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
-  const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
-  const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
-    const value=node.textContent.trim(), parent=node.parentElement;
-    if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
-    range.selectNodeContents(node); const r=range.getBoundingClientRect();
-    if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
-      words.push(value); length+=value.length;
-    }
-  }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const height=document.documentElement.scrollHeight;
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
