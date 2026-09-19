@@ -12,10 +12,42 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
+GATEWAY_PATH = "/v4/ai/evaluation-model"
+
+
+def gateway_url():
+    """Vercel AI Gateway base URL. Empty means the native TypeSafe API is used instead."""
+    return os.environ.get("JEV_GATEWAY_URL", "").rstrip("/")
+
+
+def jev_target():
+    """Return (url, via_gateway) for the decision-model call.
+
+    The native TypeSafe API and the Vercel AI Gateway accept the same questions but
+    differ in endpoint, where the model id lives, and where confidence is reported.
+    """
+    if gateway_url():
+        return gateway_url() + GATEWAY_PATH, True
+    base = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai/v1").rstrip("/")
+    return base + "/systemone", False
+
+
+def gateway_headers(url):
+    """The gateway carries the model id and spec versions in transport headers."""
+    if GATEWAY_PATH not in url:
+        return {}
+    return {
+        "ai-gateway-protocol-version": "0.0.1",
+        "ai-evaluation-model-specification-version": "4",
+        "ai-model-id": os.environ.get("JEV_MODEL_ID", "typesafe-ai/jev"),
+    }
+
+
 def post_json(url, key, body):
+    headers = {"Authorization": f"Bearer {key}", **gateway_headers(url)}
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -105,7 +137,6 @@ def choose(state, goal, history):
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
     body = {
-        "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
             "page": {k: state[k] for k in ("url", "title", "text")},
             "elements": elements,
@@ -115,16 +146,29 @@ def choose(state, goal, history):
         },
         "questions": questions,
     }
+    url, via_gateway = jev_target()
+    if not via_gateway:
+        # The native TypeSafe API takes the model in the body; the gateway takes it
+        # in the ai-model-id header and rejects a body model field.
+        body["model"] = os.environ.get("TYPESAFE_MODEL", "jev-latest")
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
-    operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
+    result = post_json(url, os.environ["TYPESAFE_API_KEY"], body)
+    answers = result["answers"]
+    if via_gateway:
+        # The gateway reports confidence per question under providerMetadata, not inside
+        # each answer. Fold it back in so the rest of the loop sees one shape.
+        confidence = ((result.get("providerMetadata") or {}).get("typesafe") or {}).get("confidence") or {}
+        for qid, answer in answers.items():
+            if isinstance(answer, dict):
+                answer.setdefault("confidence", confidence.get(qid, 0.0))
+    operation_answer = validate_choice(answers.get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
     target_answer = None
     probabilities = {}
     if operation in targets:
         # Unused target heads cannot cause an action. Validate the head selected by the operation.
-        target_answer = validate_choice(result["answers"].get(operation.lower() + "_target", {}), targets[operation])
+        target_answer = validate_choice(answers.get(operation.lower() + "_target", {}), targets[operation])
         target = target_answer["choice"]
         choice = targets[operation][target]["id"]
         probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()}
@@ -140,8 +184,8 @@ def choose(state, goal, history):
         "operation_probabilities": operation_answer["probabilities"],
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
-        "raw_answers": result["answers"],
-        "model": result["model"],
+        "raw_answers": answers,
+        "model": result.get("model") or os.environ.get("JEV_MODEL_ID", "typesafe-ai/jev"),
         "usage": result.get("usage", {}),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,
