@@ -1,0 +1,38 @@
+{
+  "_note": "Demo account only. Chrome must already be logged into Bitget and switched to the Demo (unified) account on :9222 before running.",
+  "url": "https://www.bitget.com/trade-swap/usdc/BTCPERP",
+  "reset": true,
+  "settle_seconds": 5,
+  "max_steps": 25,
+  "retries": 1,
+  "keep_open": true,
+  "artifacts": "artifacts/verify",
+  "points": [
+    {
+      "id": "limit_buy",
+      "goal": "Place a limit buy (long) order for 0.001 BTC at price 70000 using post-only, with take profit 72000 and stop loss 68000. Click the 'Limit' tab if not already selected. Click the 'Post only' tab so the order only rests on the book. Fill the 'Price' textbox with 70000. Fill the 'Quantity' textbox with 0.001. Tick the 'TP/SL' checkbox if it is not already checked (its checked state is shown for each element; never untick it). Then fill the 'Take profit' textbox with 72000 and the 'Stop loss' textbox with 68000. Click the 'Buy (long)' button. Click the confirm button in the order confirmation dialog. While an order confirmation dialog is open, never click the order button again (the dialog covers it); click the dialog's Confirm button instead. After confirming, do not touch any other control in the order panel. Then click the 'Open orders' tab to view the order list. Stop when the Open orders list shows a new open limit buy order for 0.001 BTC at 70000.",
+      "precheck": {
+        "text_contains": ["Open orders"]
+      },
+      "assert": {
+        "count_grew": "open_orders"
+      },
+      "info": {
+        "text_contains": ["70000", "0.001"]
+      }
+    },
+    {
+      "id": "market_buy",
+      "goal": "Place a market buy (long) order for 0.001 BTC with cross margin, with take profit 83000 and stop loss 79000. Set the margin mode to cross once: if a margin mode menu is already open, click its 'Confirm' button to close it; otherwise click the 'Cross' margin mode button and then click 'Confirm' in the menu that opens. Do not click the margin mode button twice. Click the 'Market' tab. Fill the 'Quantity' textbox with 0.001. Tick the 'TP/SL' checkbox if it is not already checked (its checked state is shown for each element; never untick it). Then fill the 'Take profit' textbox with 83000 and the 'Stop loss' textbox with 79000. Click the 'Buy (long)' button. Click the confirm button in the order confirmation dialog. While an order confirmation dialog is open, never click the order button again (the dialog covers it); click the dialog's Confirm button instead. After confirming, do not touch any other control in the order panel. Then click the 'Positions' tab to view positions. Stop when the Positions list shows a long position for 0.001 BTC.",
+      "precheck": {
+        "text_contains": ["Positions"]
+      },
+      "assert": {
+        "count_grew": "positions"
+      },
+      "info": {
+        "text_contains": ["0.001"]
+      }
+    }
+  ]
+}
